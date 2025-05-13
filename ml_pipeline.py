@@ -9,8 +9,8 @@ import time  # To measure training durations
 # Scikit-learn modules for preprocessing, modeling, evaluation, and dimensionality reduction
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, roc_curve, auc
+from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, roc_curve, accuracy_score, precision_score, recall_score, f1_score
 from sklearn.decomposition import PCA
 
 # XGBoost for gradient boosting
@@ -37,6 +37,8 @@ class MLPipeline:
         self.history = None
         self.training_times = {}
 
+    # Data load and process
+
     def load_dataset(self):
         """Load dataset from CSV file."""
         self.df = pd.read_csv(self.filepath)
@@ -54,6 +56,8 @@ class MLPipeline:
         self.X_test = X_test
         self.y_train = y_train
         self.y_test = y_test
+
+    # Model Training
 
     def train_random_forest(self):
         """Train Random Forest model and print classification report."""
@@ -94,6 +98,27 @@ class MLPipeline:
         self.training_times['DNN'] = end - start
         preds = (self.dnn_model.predict(self.X_test_scaled) > 0.5).astype("int32")
         print("DNN Classification Report:\n", classification_report(self.y_test, preds))
+
+    def train_adaboost(self):
+        """
+        Train an AdaBoost classifier.
+        """
+        self.ada_model = AdaBoostClassifier(n_estimators=100, random_state=42)
+        self.ada_model.fit(self.X_train_scaled, self.y_train)
+        self.ada_preds = self.ada_model.predict(self.X_test_scaled)
+        print("AdaBoost Report:\n", classification_report(self.y_test, self.ada_preds))
+
+    def train_cost_sensitive_rf(self):
+        """
+        Train a cost-sensitive Random Forest using class weights.
+        """
+        self.rf_cs_model = RandomForestClassifier(n_estimators=100, max_depth=10,
+                                                  class_weight='balanced', random_state=42)
+        self.rf_cs_model.fit(self.X_train_scaled, self.y_train)
+        self.rf_cs_preds = self.rf_cs_model.predict(self.X_test_scaled)
+        print("Cost-Sensitive RF Report:\n", classification_report(self.y_test, self.rf_cs_preds))
+
+    # Visualizations
 
     def visualize_heatmap(self):
         """Generate and save correlation heatmap."""
@@ -213,7 +238,50 @@ class MLPipeline:
         plt.title("SHAP Summary Plot for XGBoost")
         plt.savefig("shap_summary_plot.png")
         plt.close()
+    
+    
+    def plot_model_comparison(self):
+        """
+        Compute accuracy, precision, recall, and F1-score for each model,
+        and display them in a grouped bar chart.
+        """
+        metrics = {
+            "Random Forest": self.rf.predict(self.X_test_scaled),
+            "XGBoost": self.xgb_model.predict(self.X_test_scaled),
+            "DNN": (self.dnn_model.predict(self.X_test_scaled) > 0.5).astype("int32").flatten(),
+            "AdaBoost": self.ada_preds,
+            "Cost-Sensitive RF": self.rf_cs_preds,
+        }
 
+        results = {
+            "Model": [],
+            "Accuracy": [],
+            "Precision": [],
+            "Recall": [],
+            "F1-score": []
+        }
+
+        for model_name, preds in metrics.items():
+            results["Model"].append(model_name)
+            results["Accuracy"].append(accuracy_score(self.y_test, preds))
+            results["Precision"].append(precision_score(self.y_test, preds))
+            results["Recall"].append(recall_score(self.y_test, preds))
+            results["F1-score"].append(f1_score(self.y_test, preds))
+
+        df_results = pd.DataFrame(results)
+        df_results.set_index("Model", inplace=True)
+        
+        # Plot grouped bar chart
+        df_results.plot(kind="bar", figsize=(12, 6))
+        plt.title("Model Performance Comparison")
+        plt.ylabel("Score")
+        plt.ylim(0, 1)
+        plt.xticks(rotation=45)
+        plt.legend(loc="lower right")
+        plt.tight_layout()
+        plt.savefig("model_comparison_plot.png")
+        plt.close()
+   
 
 # Main block to run the full ML pipeline when the script is executed
 if __name__ == "__main__":
@@ -223,6 +291,8 @@ if __name__ == "__main__":
     pipeline.train_random_forest()                # Train and evaluate Random Forest model
     pipeline.train_xgboost()                      # Train and evaluate XGBoost model
     pipeline.train_dnn()                          # Train and evaluate Deep Neural Network
+    pipeline.train_adaboost()                     # Train and evaluate Adaboost
+    pipeline.train_cost_sensitive_rf()            # Train and evaluate Cost Sensitive               
     pipeline.visualize_heatmap()                  # Create correlation heatmap of features
     pipeline.visualize_label_distribution()       # Visualize original label distribution
     pipeline.visualize_normalized_labels()        # Show distribution of labels after encoding
@@ -234,4 +304,4 @@ if __name__ == "__main__":
     pipeline.visualize_pca_projection()           # Visualize test data in 2D using PCA
     pipeline.visualize_training_time()            # Compare training time for each model
     pipeline.visualize_shap_summary()             # Visualize SHAP summary plot for XGBoost
-
+    pipeline.plot_model_comparison()              # Visualization compared by the accuracy, precision, recall, & f1 score of all models
