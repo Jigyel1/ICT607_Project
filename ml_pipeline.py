@@ -1,25 +1,33 @@
-# Import necessary libraries for data manipulation, visualization, machine learning, and deep learning
+# Import necessary libraries
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import shap  # For model explainability using SHAP values
-import time  # To measure training durations
+import time
 
-# Scikit-learn modules for preprocessing, modeling, evaluation, and dimensionality reduction
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier
-from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, roc_curve, accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, roc_curve, roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
 from sklearn.decomposition import PCA
-
-# XGBoost for gradient boosting
+from sklearn.inspection import permutation_importance
 import xgboost as xgb
-
-# TensorFlow and Keras for deep neural network modeling
 import tensorflow as tf
 from tensorflow.keras import layers, models
 
+# Custom wrapper for Keras model to ensure binary predictions
+class KerasClassifierWrapper:
+    def __init__(self, keras_model):
+        self.keras_model = keras_model
+
+    def fit(self, X, y, **kwargs):
+        return self.keras_model.fit(X, y, **kwargs)
+
+    def predict(self, X):
+        return (self.keras_model.predict(X, verbose=0) > 0.5).astype("int32")
+
+    def predict_proba(self, X):
+        return self.keras_model.predict(X, verbose=0)
 
 # Define the machine learning pipeline as a class
 class MLPipeline:
@@ -34,10 +42,10 @@ class MLPipeline:
         self.rf = None
         self.xgb_model = None
         self.dnn_model = None
+        self.ada_model = None
+        self.rf_cs_model = None
         self.history = None
         self.training_times = {}
-
-    # Data load and process
 
     def load_dataset(self):
         """Load dataset from CSV file."""
@@ -56,13 +64,14 @@ class MLPipeline:
         self.X_test = X_test
         self.y_train = y_train
         self.y_test = y_test
-
-    # Model Training
+        # Split training data for validation metrics (10% validation)
+        self.X_train_sub, self.X_val, self.y_train_sub, self.y_val = train_test_split(
+            self.X_train_scaled, self.y_train, test_size=0.1, random_state=42)
 
     def train_random_forest(self):
         """Train Random Forest model and print classification report."""
         start = time.time()
-        self.rf = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
+        self.rf = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1)
         self.rf.fit(self.X_train_scaled, self.y_train)
         end = time.time()
         self.training_times['Random Forest'] = end - start
@@ -93,33 +102,52 @@ class MLPipeline:
         self.dnn_model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
         start = time.time()
         self.history = self.dnn_model.fit(self.X_train_scaled, self.y_train, epochs=10,
-                                          batch_size=64, validation_split=0.2, verbose=1)
+                                          batch_size=64, validation_split=0.1, verbose=1)
         end = time.time()
         self.training_times['DNN'] = end - start
-        preds = (self.dnn_model.predict(self.X_test_scaled) > 0.5).astype("int32")
+        preds = (self.dnn_model.predict(self.X_test_scaled, verbose=0) > 0.5).astype("int32")
         print("DNN Classification Report:\n", classification_report(self.y_test, preds))
 
     def train_adaboost(self):
-        """
-        Train an AdaBoost classifier.
-        """
+        """Train AdaBoost classifier and print classification report."""
+        start = time.time()
         self.ada_model = AdaBoostClassifier(n_estimators=100, random_state=42)
         self.ada_model.fit(self.X_train_scaled, self.y_train)
+        end = time.time()
+        self.training_times['AdaBoost'] = end - start
         self.ada_preds = self.ada_model.predict(self.X_test_scaled)
         print("AdaBoost Report:\n", classification_report(self.y_test, self.ada_preds))
 
     def train_cost_sensitive_rf(self):
-        """
-        Train a cost-sensitive Random Forest using class weights.
-        """
+        """Train Cost-Sensitive Random Forest and print classification report."""
+        start = time.time()
         self.rf_cs_model = RandomForestClassifier(n_estimators=100, max_depth=10,
-                                                  class_weight='balanced', random_state=42)
+                                                  class_weight='balanced', random_state=42, n_jobs=-1)
         self.rf_cs_model.fit(self.X_train_scaled, self.y_train)
+        end = time.time()
+        self.training_times['Cost-Sensitive RF'] = end - start
         self.rf_cs_preds = self.rf_cs_model.predict(self.X_test_scaled)
         print("Cost-Sensitive RF Report:\n", classification_report(self.y_test, self.rf_cs_preds))
 
-    # Visualizations
+    def compute_subset_metrics(self, model, model_name):
+        """Compute training and validation accuracy over data subsets for tree-based models."""
+        fractions = [0.2, 0.4, 0.6, 0.8, 1.0]  # Use 5 subsets of training data
+        train_acc = []
+        val_acc = []
+        n_samples = len(self.X_train_sub)
+        for frac in fractions:
+            # Select subset of training data
+            subset_size = int(n_samples * frac)
+            X_subset = self.X_train_sub[:subset_size]
+            y_subset = self.y_train_sub[:subset_size]
+            # Train model on subset
+            model.fit(X_subset, y_subset)
+            # Compute metrics
+            train_acc.append(accuracy_score(y_subset, model.predict(X_subset)))
+            val_acc.append(accuracy_score(self.y_val, model.predict(self.X_val)))
+        return train_acc, val_acc
 
+    # Visualization methods
     def visualize_heatmap(self):
         """Generate and save correlation heatmap."""
         sns.heatmap(self.df.corr(), cmap='coolwarm')
@@ -146,17 +174,138 @@ class MLPipeline:
         """Visualize feature importances from Random Forest."""
         importances = self.rf.feature_importances_
         indices = np.argsort(importances)[-10:]
-        plt.barh(range(len(indices)), importances[indices])
+        plt.barh(range(len(indices)), importances[indices], color='skyblue')
         plt.yticks(range(len(indices)), [self.X_test.columns[i] for i in indices])
-        plt.title("RF Top 10 Feature Importances")
+        plt.title("Random Forest: Top 10 Feature Importances")
+        plt.tight_layout()
         plt.savefig("rf_feature_importance.png")
         plt.close()
 
     def visualize_xgb_importance(self):
         """Visualize feature importances from XGBoost."""
         xgb.plot_importance(self.xgb_model, max_num_features=10, importance_type='gain', height=0.5)
-        plt.title("XGBoost Feature Importance")
+        plt.title("XGBoost: Top 10 Feature Importances")
+        plt.tight_layout()
         plt.savefig("xgb_feature_importance.png")
+        plt.close()
+
+    def visualize_adaboost_importance(self):
+        """Visualize feature importances from AdaBoost."""
+        importances = self.ada_model.feature_importances_
+        indices = np.argsort(importances)[-10:]
+        plt.barh(range(len(indices)), importances[indices], color='orange')
+        plt.yticks(range(len(indices)), [self.X_test.columns[i] for i in indices])
+        plt.title("AdaBoost: Top 10 Feature Importances")
+        plt.tight_layout()
+        plt.savefig("ada_feature_importance.png")
+        plt.close()
+
+    def visualize_cost_sensitive_rf_importance(self):
+        """Visualize feature importances from Cost-Sensitive RF."""
+        importances = self.rf_cs_model.feature_importances_
+        indices = np.argsort(importances)[-10:]
+        plt.barh(range(len(indices)), importances[indices], color='green')
+        plt.yticks(range(len(indices)), [self.X_test.columns[i] for i in indices])
+        plt.title("Cost-Sensitive RF: Top 10 Feature Importances")
+        plt.tight_layout()
+        plt.savefig("cost_sensitive_rf_feature_importance.png")
+        plt.close()
+
+    def visualize_dnn_permutation_importance(self):
+        """Estimate DNN feature importance using permutation importance."""
+        # Subsample test set to reduce computation time
+        np.random.seed(42)
+        sample_indices = np.random.choice(len(self.X_test_scaled), size=10000, replace=False)
+        X_test_sample = self.X_test_scaled[sample_indices]
+        y_test_sample = self.y_test.iloc[sample_indices] if isinstance(self.y_test, pd.Series) else self.y_test[sample_indices]
+        
+        wrapped_model = KerasClassifierWrapper(self.dnn_model)
+        result = permutation_importance(
+            estimator=wrapped_model, X=X_test_sample, y=y_test_sample,
+            n_repeats=2, random_state=42, scoring='accuracy'
+        )
+        importances = result.importances_mean
+        indices = np.argsort(importances)[-10:]
+        plt.barh(range(len(indices)), importances[indices], color='red')
+        plt.yticks(range(len(indices)), [self.X_test.columns[i] for i in indices])
+        plt.title("DNN: Top 10 Permutation Importances")
+        plt.tight_layout()
+        plt.savefig("dnn_feature_importance.png")
+        plt.close()
+
+    def visualize_dnn_metrics(self):
+        """Plot DNN accuracy during training."""
+        plt.plot(self.history.history['accuracy'], label='train')
+        plt.plot(self.history.history['val_accuracy'], label='val')
+        plt.title("DNN Accuracy")
+        plt.xlabel("Epoch")
+        plt.ylabel("Accuracy")
+        plt.legend()
+        plt.savefig("dnn_accuracy.png")
+        plt.close()
+
+    def visualize_rf_metrics(self):
+        """Plot Random Forest accuracy over data subsets."""
+        model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1)
+        train_acc, val_acc = self.compute_subset_metrics(model, "Random Forest")
+        plt.plot([20, 40, 60, 80, 100], train_acc, label='train')
+        plt.plot([20, 40, 60, 80, 100], val_acc, label='val')
+        plt.title("Random Forest Accuracy")
+        plt.xlabel("Training Data Used (%)")
+        plt.ylabel("Accuracy")
+        plt.legend()
+        plt.savefig("rf_accuracy.png")
+        plt.close()
+
+    def visualize_xgb_metrics(self):
+        """Plot XGBoost accuracy over data subsets."""
+        model = xgb.XGBClassifier(n_estimators=200, learning_rate=0.05, max_depth=6,
+                                  subsample=0.8, colsample_bytree=0.8, random_state=42)
+        train_acc, val_acc = self.compute_subset_metrics(model, "XGBoost")
+        plt.plot([20, 40, 60, 80, 100], train_acc, label='train')
+        plt.plot([20, 40, 60, 80, 100], val_acc, label='val')
+        plt.title("XGBoost Accuracy")
+        plt.xlabel("Training Data Used (%)")
+        plt.ylabel("Accuracy")
+        plt.legend()
+        plt.savefig("xgb_accuracy.png")
+        plt.close()
+
+    def visualize_adaboost_metrics(self):
+        """Plot AdaBoost accuracy over data subsets."""
+        model = AdaBoostClassifier(n_estimators=100, random_state=42)
+        train_acc, val_acc = self.compute_subset_metrics(model, "AdaBoost")
+        plt.plot([20, 40, 60, 80, 100], train_acc, label='train')
+        plt.plot([20, 40, 60, 80, 100], val_acc, label='val')
+        plt.title("AdaBoost Accuracy")
+        plt.xlabel("Training Data Used (%)")
+        plt.ylabel("Accuracy")
+        plt.legend()
+        plt.savefig("ada_accuracy.png")
+        plt.close()
+
+    def visualize_cost_sensitive_rf_metrics(self):
+        """Plot Cost-Sensitive Random Forest accuracy over data subsets."""
+        model = RandomForestClassifier(n_estimators=100, max_depth=10,
+                                      class_weight='balanced', random_state=42, n_jobs=-1)
+        train_acc, val_acc = self.compute_subset_metrics(model, "Cost-Sensitive RF")
+        plt.plot([20, 40, 60, 80, 100], train_acc, label='train')
+        plt.plot([20, 40, 60, 80, 100], val_acc, label='val')
+        plt.title("Cost-Sensitive Random Forest Accuracy")
+        plt.xlabel("Training Data Used (%)")
+        plt.ylabel("Accuracy")
+        plt.legend()
+        plt.savefig("rf_cs_accuracy.png")
+        plt.close()
+
+    def visualize_pca_projection(self):
+        """Visualize PCA projection of test data."""
+        pca = PCA(n_components=2)
+        components = pca.fit_transform(self.X_test_scaled)
+        plt.scatter(components[:, 0], components[:, 1], c=self.y_test, cmap='coolwarm', alpha=0.6)
+        plt.title("PCA Projection of Test Data")
+        plt.colorbar()
+        plt.savefig("pca_projection.png")
         plt.close()
 
     def visualize_confusion_matrices(self):
@@ -171,55 +320,54 @@ class MLPipeline:
         plt.savefig("xgb_confusion_matrix.png")
         plt.close()
 
-        dnn_preds = (self.dnn_model.predict(self.X_test_scaled) > 0.5).astype("int32")
+        dnn_preds = (self.dnn_model.predict(self.X_test_scaled, verbose=0) > 0.5).astype("int32")
         cm = confusion_matrix(self.y_test, dnn_preds)
         sns.heatmap(cm, annot=True, fmt="d")
         plt.title("DNN Confusion Matrix")
         plt.savefig("dnn_confusion_matrix.png")
         plt.close()
 
-    def visualize_dnn_metrics(self):
-        """Plot DNN accuracy and loss during training."""
-        plt.plot(self.history.history['accuracy'], label='train')
-        plt.plot(self.history.history['val_accuracy'], label='val')
-        plt.title("DNN Accuracy")
-        plt.legend()
-        plt.savefig("dnn_accuracy.png")
+        cm_ada = confusion_matrix(self.y_test, self.ada_preds)
+        sns.heatmap(cm_ada, annot=True, fmt="d", cmap="Oranges")
+        plt.title("AdaBoost Confusion Matrix")
+        plt.xlabel("Predicted")
+        plt.ylabel("Actual")
+        plt.savefig("adaboost_confusion_matrix.png")
         plt.close()
 
-        plt.plot(self.history.history['loss'], label='train')
-        plt.plot(self.history.history['val_loss'], label='val')
-        plt.title("DNN Loss")
-        plt.legend()
-        plt.savefig("dnn_loss.png")
+        cm_cs = confusion_matrix(self.y_test, self.rf_cs_preds)
+        sns.heatmap(cm_cs, annot=True, fmt="d", cmap="Greens")
+        plt.title("Cost-Sensitive RF Confusion Matrix")
+        plt.xlabel("Predicted")
+        plt.ylabel("Actual")
+        plt.savefig("cost_sensitive_rf_confusion_matrix.png")
         plt.close()
 
     def visualize_roc_curves(self):
         """Plot ROC curves for all models."""
-        rf_probs = self.rf.predict_proba(self.X_test_scaled)[:, 1]
-        xgb_probs = self.xgb_model.predict_proba(self.X_test_scaled)[:, 1]
-        dnn_probs = self.dnn_model.predict(self.X_test_scaled).ravel()
-        rf_fpr, rf_tpr, _ = roc_curve(self.y_test, rf_probs)
-        xgb_fpr, xgb_tpr, _ = roc_curve(self.y_test, xgb_probs)
-        dnn_fpr, dnn_tpr, _ = roc_curve(self.y_test, dnn_probs)
+        plt.figure(figsize=(10, 8))
+        fpr_rf, tpr_rf, _ = roc_curve(self.y_test, self.rf.predict_proba(self.X_test_scaled)[:, 1])
+        plt.plot(fpr_rf, tpr_rf, label=f'Random Forest (AUC = {roc_auc_score(self.y_test, self.rf.predict_proba(self.X_test_scaled)[:, 1]):.2f})')
 
-        plt.plot(rf_fpr, rf_tpr, label="RF")
-        plt.plot(xgb_fpr, xgb_tpr, label="XGB")
-        plt.plot(dnn_fpr, dnn_tpr, label="DNN")
+        fpr_xgb, tpr_xgb, _ = roc_curve(self.y_test, self.xgb_model.predict_proba(self.X_test_scaled)[:, 1])
+        plt.plot(fpr_xgb, tpr_xgb, label=f'XGBoost (AUC = {roc_auc_score(self.y_test, self.xgb_model.predict_proba(self.X_test_scaled)[:, 1]):.2f})')
+
+        dnn_probs = self.dnn_model.predict(self.X_test_scaled, verbose=0).ravel()
+        fpr_dnn, tpr_dnn, _ = roc_curve(self.y_test, dnn_probs)
+        plt.plot(fpr_dnn, tpr_dnn, label=f'DNN (AUC = {roc_auc_score(self.y_test, dnn_probs):.2f})')
+
+        fpr_ada, tpr_ada, _ = roc_curve(self.y_test, self.ada_model.predict_proba(self.X_test_scaled)[:, 1])
+        plt.plot(fpr_ada, tpr_ada, label=f'AdaBoost (AUC = {roc_auc_score(self.y_test, self.ada_model.predict_proba(self.X_test_scaled)[:, 1]):.2f})')
+
+        fpr_rfcs, tpr_rfcs, _ = roc_curve(self.y_test, self.rf_cs_model.predict_proba(self.X_test_scaled)[:, 1])
+        plt.plot(fpr_rfcs, tpr_rfcs, label=f'Cost-Sensitive RF (AUC = {roc_auc_score(self.y_test, self.rf_cs_model.predict_proba(self.X_test_scaled)[:, 1]):.2f})')
+
         plt.plot([0, 1], [0, 1], 'k--')
-        plt.title("ROC Curves")
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('ROC Curve Comparison')
         plt.legend()
-        plt.savefig("roc_curves.png")
-        plt.close()
-
-    def visualize_pca_projection(self):
-        """Visualize PCA projection of test data."""
-        pca = PCA(n_components=2)
-        components = pca.fit_transform(self.X_test_scaled)
-        plt.scatter(components[:, 0], components[:, 1], c=self.y_test, cmap='coolwarm', alpha=0.6)
-        plt.title("PCA Projection of Test Data")
-        plt.colorbar()
-        plt.savefig("pca_projection.png")
+        plt.savefig("roc_comparison_plot.png")
         plt.close()
 
     def visualize_training_time(self):
@@ -230,29 +378,15 @@ class MLPipeline:
         plt.savefig("training_time.png")
         plt.close()
 
-    def visualize_shap_summary(self):
-        """Visualize SHAP values for XGBoost model to interpret feature importance and contribution."""
-        explainer = shap.Explainer(self.xgb_model)
-        shap_values = explainer(self.X_test_scaled)
-        shap.summary_plot(shap_values, self.X_test, show=False)
-        plt.title("SHAP Summary Plot for XGBoost")
-        plt.savefig("shap_summary_plot.png")
-        plt.close()
-    
-    
     def plot_model_comparison(self):
-        """
-        Compute accuracy, precision, recall, and F1-score for each model,
-        and display them in a grouped bar chart.
-        """
+        """Compute and display model performance metrics in a grouped bar chart."""
         metrics = {
             "Random Forest": self.rf.predict(self.X_test_scaled),
             "XGBoost": self.xgb_model.predict(self.X_test_scaled),
-            "DNN": (self.dnn_model.predict(self.X_test_scaled) > 0.5).astype("int32").flatten(),
+            "DNN": (self.dnn_model.predict(self.X_test_scaled, verbose=0) > 0.5).astype("int32").flatten(),
             "AdaBoost": self.ada_preds,
             "Cost-Sensitive RF": self.rf_cs_preds,
         }
-
         results = {
             "Model": [],
             "Accuracy": [],
@@ -260,18 +394,14 @@ class MLPipeline:
             "Recall": [],
             "F1-score": []
         }
-
         for model_name, preds in metrics.items():
             results["Model"].append(model_name)
             results["Accuracy"].append(accuracy_score(self.y_test, preds))
             results["Precision"].append(precision_score(self.y_test, preds))
             results["Recall"].append(recall_score(self.y_test, preds))
             results["F1-score"].append(f1_score(self.y_test, preds))
-
         df_results = pd.DataFrame(results)
         df_results.set_index("Model", inplace=True)
-        
-        # Plot grouped bar chart
         df_results.plot(kind="bar", figsize=(12, 6))
         plt.title("Model Performance Comparison")
         plt.ylabel("Score")
@@ -281,27 +411,32 @@ class MLPipeline:
         plt.tight_layout()
         plt.savefig("model_comparison_plot.png")
         plt.close()
-   
 
-# Main block to run the full ML pipeline when the script is executed
+# Main block to run the full ML pipeline
 if __name__ == "__main__":
-    pipeline = MLPipeline("NF-UNSW-NB15-V2.csv")  # Instantiate the pipeline with dataset path
-    pipeline.load_dataset()                       # Load the dataset into a DataFrame
-    pipeline.preprocess_data()                    # Encode, split, and normalize data
-    pipeline.train_random_forest()                # Train and evaluate Random Forest model
-    pipeline.train_xgboost()                      # Train and evaluate XGBoost model
-    pipeline.train_dnn()                          # Train and evaluate Deep Neural Network
-    pipeline.train_adaboost()                     # Train and evaluate Adaboost
-    pipeline.train_cost_sensitive_rf()            # Train and evaluate Cost Sensitive               
-    pipeline.visualize_heatmap()                  # Create correlation heatmap of features
-    pipeline.visualize_label_distribution()       # Visualize original label distribution
-    pipeline.visualize_normalized_labels()        # Show distribution of labels after encoding
-    pipeline.visualize_rf_importance()            # Feature importance for Random Forest
-    pipeline.visualize_xgb_importance()           # Feature importance for XGBoost
-    pipeline.visualize_confusion_matrices()       # Show confusion matrices for all models
-    pipeline.visualize_dnn_metrics()              # Plot DNN training accuracy and loss
-    pipeline.visualize_roc_curves()               # Plot ROC curves for all models
-    pipeline.visualize_pca_projection()           # Visualize test data in 2D using PCA
-    pipeline.visualize_training_time()            # Compare training time for each model
-    pipeline.visualize_shap_summary()             # Visualize SHAP summary plot for XGBoost
-    pipeline.plot_model_comparison()              # Visualization compared by the accuracy, precision, recall, & f1 score of all models
+    pipeline = MLPipeline("NF-UNSW-NB15-V2.csv")
+    pipeline.load_dataset()
+    pipeline.preprocess_data()
+    pipeline.train_random_forest()
+    pipeline.train_xgboost()
+    pipeline.train_dnn()
+    pipeline.train_adaboost()
+    pipeline.train_cost_sensitive_rf()
+    pipeline.visualize_heatmap()
+    pipeline.visualize_label_distribution()
+    pipeline.visualize_normalized_labels()
+    pipeline.visualize_rf_importance()
+    pipeline.visualize_xgb_importance()
+    pipeline.visualize_adaboost_importance()
+    pipeline.visualize_cost_sensitive_rf_importance()
+    pipeline.visualize_dnn_permutation_importance()
+    pipeline.visualize_dnn_metrics()
+    pipeline.visualize_rf_metrics()
+    pipeline.visualize_xgb_metrics()
+    pipeline.visualize_adaboost_metrics()
+    pipeline.visualize_cost_sensitive_rf_metrics()
+    pipeline.visualize_pca_projection()
+    pipeline.visualize_confusion_matrices()
+    pipeline.visualize_roc_curves()
+    pipeline.visualize_training_time()
+    pipeline.plot_model_comparison()
