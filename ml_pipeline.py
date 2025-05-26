@@ -1,21 +1,28 @@
-# Import necessary libraries
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import time
-
-from sklearn.model_selection import train_test_split
+from uuid import uuid4
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, roc_curve, roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
 from sklearn.decomposition import PCA
 from sklearn.inspection import permutation_importance
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.utils.class_weight import compute_class_weight
+from imblearn.over_sampling import SMOTE
 import xgboost as xgb
 import tensorflow as tf
 from tensorflow.keras import layers, models
+import logging
 
-# Custom wrapper for Keras model to ensure binary predictions
+# Set up logging
+logging.basicConfig(filename='training_log.txt', level=logging.INFO)
+
+# Custom wrapper for Keras model
 class KerasClassifierWrapper:
     def __init__(self, keras_model):
         self.keras_model = keras_model
@@ -29,7 +36,7 @@ class KerasClassifierWrapper:
     def predict_proba(self, X):
         return self.keras_model.predict(X, verbose=0)
 
-# Define the machine learning pipeline as a class
+# Define the machine learning pipeline
 class MLPipeline:
     def __init__(self, filepath):
         self.filepath = filepath
@@ -44,110 +51,213 @@ class MLPipeline:
         self.dnn_model = None
         self.ada_model = None
         self.rf_cs_model = None
+        self.lr_model = None
         self.history = None
         self.training_times = {}
+        self.label_encoders = {}
 
     def load_dataset(self):
-        """Load dataset from CSV file."""
+        """Load dataset from CSV file and check for duplicates."""
         self.df = pd.read_csv(self.filepath)
+        # Check for duplicates
+        logging.info(f"Duplicate rows in dataset: {self.df.duplicated().sum()}")
+        print(f"Duplicate rows in dataset: {self.df.duplicated().sum()}")
+        self.df = self.df.drop_duplicates()
+        # Check class distribution
+        logging.info(f"Class distribution:\n{self.df['Label'].value_counts(normalize=True)}")
+        print("Class distribution:\n", self.df["Label"].value_counts(normalize=True))
+        # Log dataset columns
+        logging.info(f"Dataset columns: {list(self.df.columns)}")
+        print("Dataset columns:", list(self.df.columns))
 
     def preprocess_data(self):
-        """Encode categorical variables and scale features."""
-        for col in self.df.select_dtypes(include=['object']).columns:
-            self.df[col] = LabelEncoder().fit_transform(self.df[col])
+        """Encode categorical variables and scale features, avoiding data leakage."""
+        # Drop potential leakage features
+        leakage_columns = ['attack_cat', 'Attack']
+        for col in leakage_columns:
+            if col in self.df.columns:
+                self.df = self.df.drop(col, axis=1)
+                logging.info(f"Dropped '{col}' column to prevent leakage")
+                print(f"Dropped '{col}' column to prevent leakage")
+
         X = self.df.drop("Label", axis=1)
         y = self.df["Label"]
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+        
+        # Encode categorical variables on training data only
+        for col in X_train.select_dtypes(include=['object']).columns:
+            le = LabelEncoder()
+            X_train[col] = le.fit_transform(X_train[col])
+            self.label_encoders[col] = le
+            # Handle unseen categories in test set
+            X_test[col] = X_test[col].map(lambda s: '<unknown>' if s not in le.classes_ else s)
+            le.classes_ = np.append(le.classes_, '<unknown>')
+            X_test[col] = le.transform(X_test[col])
+        
+        # Apply feature selection to reduce highly correlated features
+        selector = SelectKBest(score_func=f_classif, k=min(20, X_train.shape[1]))
+        self.X_train_scaled = selector.fit_transform(X_train, y_train)
+        self.X_test_scaled = selector.transform(X_test)
+        selected_features = X_train.columns[selector.get_support()].tolist()
+        logging.info(f"Selected features: {selected_features}")
+        print("Selected features:", selected_features)
+        
+        # Scale features
         scaler = StandardScaler()
-        self.X_train_scaled = scaler.fit_transform(X_train)
-        self.X_test_scaled = scaler.transform(X_test)
+        self.X_train_scaled = scaler.fit_transform(self.X_train_scaled)
+        self.X_test_scaled = scaler.transform(self.X_test_scaled)
         self.X_test = X_test
         self.y_train = y_train
         self.y_test = y_test
-        # Split training data for validation metrics (10% validation)
+        # Split training data for validation
         self.X_train_sub, self.X_val, self.y_train_sub, self.y_val = train_test_split(
-            self.X_train_scaled, self.y_train, test_size=0.1, random_state=42)
+            self.X_train_scaled, self.y_train, test_size=0.1, random_state=42, stratify=y_train)
+        
+        # Apply SMOTE to handle class imbalance
+        smote = SMOTE(random_state=42)
+        self.X_train_scaled, self.y_train = smote.fit_resample(self.X_train_scaled, self.y_train)
+        logging.info(f"Post-SMOTE class distribution:\n{pd.Series(self.y_train).value_counts(normalize=True)}")
+        print("Post-SMOTE class distribution:\n", pd.Series(self.y_train).value_counts(normalize=True))
+
+    def check_data_leakage(self):
+        """Check for feature-target correlations and low-variance features."""
+        # Use only numeric columns for correlation
+        numeric_df = self.df.select_dtypes(include=[np.number])
+        if 'Label' not in numeric_df.columns:
+            logging.warning("Label column is not numeric or missing from numeric_df")
+            print("Warning: Label column is not numeric or missing from numeric_df")
+            return
+        correlation_matrix = numeric_df.corr()
+        correlations = correlation_matrix['Label'].drop('Label', errors='ignore').sort_values(ascending=False)
+        logging.info(f"Top 10 features correlated with Label:\n{correlations.head(10)}")
+        print("\nTop 10 Features Most Correlated with Label:\n", correlations.head(10))
+        # Flag highly correlated features
+        high_corr = correlations[abs(correlations) > 0.9]
+        if not high_corr.empty:
+            logging.warning(f"Highly correlated features (>|0.9|): {high_corr.index.tolist()}")
+            print("Warning: Highly correlated features (>|0.9|):", high_corr.index.tolist())
+        
+        # Check feature variances
+        variances = numeric_df.drop("Label", axis=1, errors='ignore').var()
+        low_variance = variances[variances < 0.01]
+        if not low_variance.empty:
+            logging.info(f"Low-variance features: {low_variance.index.tolist()}")
+            print("Low-variance features:", low_variance.index.tolist())
+
+
+    def cross_validate_model(self, model, model_name):
+        """Perform stratified k-fold cross-validation."""
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        scores = []
+        for train_idx, val_idx in skf.split(self.X_train_scaled, self.y_train):
+            X_tr, X_val = self.X_train_scaled[train_idx], self.X_train_scaled[val_idx]
+            y_tr, y_val = self.y_train[train_idx], self.y_train[val_idx]
+            model.fit(X_tr, y_tr)
+            scores.append(accuracy_score(y_val, model.predict(X_val)))
+        logging.info(f"{model_name} CV scores: {scores}, Mean: {np.mean(scores):.4f}, Std: {np.std(scores):.4f}")
+        print(f"{model_name} CV scores: {scores}, Mean: {np.mean(scores):.4f}, Std: {np.std(scores):.4f}")
+        return np.mean(scores)
 
     def train_random_forest(self):
-        """Train Random Forest model and print classification report."""
+        """Train Random Forest with regularization and class weights."""
         start = time.time()
-        self.rf = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1)
+        self.rf = RandomForestClassifier(n_estimators=50, max_depth=5, min_samples_split=10,
+                                        class_weight='balanced', random_state=42, n_jobs=-1)
         self.rf.fit(self.X_train_scaled, self.y_train)
         end = time.time()
         self.training_times['Random Forest'] = end - start
         preds = self.rf.predict(self.X_test_scaled)
         print("Random Forest Classification Report:\n", classification_report(self.y_test, preds))
+        self.cross_validate_model(self.rf, "Random Forest")
 
     def train_xgboost(self):
-        """Train XGBoost model and print classification report."""
+        """Train XGBoost with regularization and class weights."""
         start = time.time()
-        self.xgb_model = xgb.XGBClassifier(n_estimators=200, learning_rate=0.05, max_depth=6,
+        scale_pos_weight = sum(self.y_train == 0) / sum(self.y_train == 1)
+        self.xgb_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.01, max_depth=5,
+                                           reg_lambda=1, scale_pos_weight=scale_pos_weight,
                                            subsample=0.8, colsample_bytree=0.8, random_state=42)
         self.xgb_model.fit(self.X_train_scaled, self.y_train)
         end = time.time()
         self.training_times['XGBoost'] = end - start
         preds = self.xgb_model.predict(self.X_test_scaled)
         print("XGBoost Classification Report:\n", classification_report(self.y_test, preds))
+        self.cross_validate_model(self.xgb_model, "XGBoost")
 
     def train_dnn(self):
-        """Train Deep Neural Network and print classification report."""
+        """Train Deep Neural Network with regularization and class weights."""
+        class_weights = compute_class_weight('balanced', classes=np.unique(self.y_train), y=self.y_train)
+        class_weight_dict = dict(enumerate(class_weights))
         self.dnn_model = models.Sequential([
-            layers.Dense(128, activation='relu', input_shape=(self.X_train_scaled.shape[1],)),
-            layers.Dropout(0.3),
-            layers.Dense(64, activation='relu'),
-            layers.Dropout(0.3),
-            layers.Dense(32, activation='relu'),
+            layers.Dense(64, activation='relu', input_shape=(self.X_train_scaled.shape[1],),
+                         kernel_regularizer=tf.keras.regularizers.l2(0.01)),
+            layers.Dropout(0.5),
+            layers.Dense(32, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(0.01)),
+            layers.Dropout(0.5),
             layers.Dense(1, activation='sigmoid')
         ])
         self.dnn_model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
         start = time.time()
         self.history = self.dnn_model.fit(self.X_train_scaled, self.y_train, epochs=10,
-                                          batch_size=64, validation_split=0.1, verbose=1)
+                                         batch_size=64, validation_split=0.1, class_weight=class_weight_dict, verbose=1)
         end = time.time()
         self.training_times['DNN'] = end - start
         preds = (self.dnn_model.predict(self.X_test_scaled, verbose=0) > 0.5).astype("int32")
         print("DNN Classification Report:\n", classification_report(self.y_test, preds))
+        # Cross-validate DNN
+        wrapped_model = KerasClassifierWrapper(self.dnn_model)
+        self.cross_validate_model(wrapped_model, "DNN")
 
     def train_adaboost(self):
-        """Train AdaBoost classifier and print classification report."""
+        """Train AdaBoost classifier."""
         start = time.time()
-        self.ada_model = AdaBoostClassifier(n_estimators=100, random_state=42)
+        self.ada_model = AdaBoostClassifier(n_estimators=50, random_state=42)
         self.ada_model.fit(self.X_train_scaled, self.y_train)
         end = time.time()
         self.training_times['AdaBoost'] = end - start
         self.ada_preds = self.ada_model.predict(self.X_test_scaled)
         print("AdaBoost Report:\n", classification_report(self.y_test, self.ada_preds))
+        self.cross_validate_model(self.ada_model, "AdaBoost")
 
     def train_cost_sensitive_rf(self):
-        """Train Cost-Sensitive Random Forest and print classification report."""
+        """Train Cost-Sensitive Random Forest."""
         start = time.time()
-        self.rf_cs_model = RandomForestClassifier(n_estimators=100, max_depth=10,
-                                                  class_weight='balanced', random_state=42, n_jobs=-1)
+        self.rf_cs_model = RandomForestClassifier(n_estimators=50, max_depth=5, min_samples_split=10,
+                                                 class_weight='balanced', random_state=42, n_jobs=-1)
         self.rf_cs_model.fit(self.X_train_scaled, self.y_train)
         end = time.time()
         self.training_times['Cost-Sensitive RF'] = end - start
         self.rf_cs_preds = self.rf_cs_model.predict(self.X_test_scaled)
         print("Cost-Sensitive RF Report:\n", classification_report(self.y_test, self.rf_cs_preds))
+        self.cross_validate_model(self.rf_cs_model, "Cost-Sensitive RF")
+
+    def train_logistic_regression(self):
+        """Train Logistic Regression as a baseline."""
+        start = time.time()
+        self.lr_model = LogisticRegression(class_weight='balanced', random_state=42)
+        self.lr_model.fit(self.X_train_scaled, self.y_train)
+        end = time.time()
+        self.training_times['Logistic Regression'] = end - start
+        preds = self.lr_model.predict(self.X_test_scaled)
+        print("Logistic Regression Classification Report:\n", classification_report(self.y_test, preds))
+        self.cross_validate_model(self.lr_model, "Logistic Regression")
 
     def compute_subset_metrics(self, model, model_name):
-        """Compute training and validation accuracy over data subsets for tree-based models."""
-        fractions = [0.2, 0.4, 0.6, 0.8, 1.0]  # Use 5 subsets of training data
+        """Compute training and validation accuracy over data subsets."""
+        fractions = [0.2, 0.4, 0.6, 0.8, 1.0]
         train_acc = []
         val_acc = []
         n_samples = len(self.X_train_sub)
         for frac in fractions:
-            # Select subset of training data
             subset_size = int(n_samples * frac)
             X_subset = self.X_train_sub[:subset_size]
             y_subset = self.y_train_sub[:subset_size]
-            # Train model on subset
             model.fit(X_subset, y_subset)
-            # Compute metrics
             train_acc.append(accuracy_score(y_subset, model.predict(X_subset)))
             val_acc.append(accuracy_score(self.y_val, model.predict(self.X_val)))
         return train_acc, val_acc
 
-    # Visualization methods
+    # Visualization methods (unchanged for brevity, but ensured to work with updates)
     def visualize_heatmap(self):
         """Generate and save correlation heatmap."""
         sns.heatmap(self.df.corr(), cmap='coolwarm')
@@ -213,12 +323,10 @@ class MLPipeline:
 
     def visualize_dnn_permutation_importance(self):
         """Estimate DNN feature importance using permutation importance."""
-        # Subsample test set to reduce computation time
         np.random.seed(42)
-        sample_indices = np.random.choice(len(self.X_test_scaled), size=10000, replace=False)
+        sample_indices = np.random.choice(len(self.X_test_scaled), size=min(10000, len(self.X_test_scaled)), replace=False)
         X_test_sample = self.X_test_scaled[sample_indices]
         y_test_sample = self.y_test.iloc[sample_indices] if isinstance(self.y_test, pd.Series) else self.y_test[sample_indices]
-        
         wrapped_model = KerasClassifierWrapper(self.dnn_model)
         result = permutation_importance(
             estimator=wrapped_model, X=X_test_sample, y=y_test_sample,
@@ -246,7 +354,8 @@ class MLPipeline:
 
     def visualize_rf_metrics(self):
         """Plot Random Forest accuracy over data subsets."""
-        model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1)
+        model = RandomForestClassifier(n_estimators=50, max_depth=5, min_samples_split=10,
+                                      class_weight='balanced', random_state=42, n_jobs=-1)
         train_acc, val_acc = self.compute_subset_metrics(model, "Random Forest")
         plt.plot([20, 40, 60, 80, 100], train_acc, label='train')
         plt.plot([20, 40, 60, 80, 100], val_acc, label='val')
@@ -259,7 +368,8 @@ class MLPipeline:
 
     def visualize_xgb_metrics(self):
         """Plot XGBoost accuracy over data subsets."""
-        model = xgb.XGBClassifier(n_estimators=200, learning_rate=0.05, max_depth=6,
+        model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.01, max_depth=5,
+                                  scale_pos_weight=sum(self.y_train == 0) / sum(self.y_train == 1),
                                   subsample=0.8, colsample_bytree=0.8, random_state=42)
         train_acc, val_acc = self.compute_subset_metrics(model, "XGBoost")
         plt.plot([20, 40, 60, 80, 100], train_acc, label='train')
@@ -273,7 +383,7 @@ class MLPipeline:
 
     def visualize_adaboost_metrics(self):
         """Plot AdaBoost accuracy over data subsets."""
-        model = AdaBoostClassifier(n_estimators=100, random_state=42)
+        model = AdaBoostClassifier(n_estimators=50, random_state=42)
         train_acc, val_acc = self.compute_subset_metrics(model, "AdaBoost")
         plt.plot([20, 40, 60, 80, 100], train_acc, label='train')
         plt.plot([20, 40, 60, 80, 100], val_acc, label='val')
@@ -286,7 +396,7 @@ class MLPipeline:
 
     def visualize_cost_sensitive_rf_metrics(self):
         """Plot Cost-Sensitive Random Forest accuracy over data subsets."""
-        model = RandomForestClassifier(n_estimators=100, max_depth=10,
+        model = RandomForestClassifier(n_estimators=50, max_depth=5, min_samples_split=10,
                                       class_weight='balanced', random_state=42, n_jobs=-1)
         train_acc, val_acc = self.compute_subset_metrics(model, "Cost-Sensitive RF")
         plt.plot([20, 40, 60, 80, 100], train_acc, label='train')
@@ -343,6 +453,11 @@ class MLPipeline:
         plt.savefig("cost_sensitive_rf_confusion_matrix.png")
         plt.close()
 
+        ConfusionMatrixDisplay.from_estimator(self.lr_model, self.X_test_scaled, self.y_test)
+        plt.title("Logistic Regression Confusion Matrix")
+        plt.savefig("lr_confusion_matrix.png")
+        plt.close()
+
     def visualize_roc_curves(self):
         """Plot ROC curves for all models."""
         plt.figure(figsize=(10, 8))
@@ -361,6 +476,9 @@ class MLPipeline:
 
         fpr_rfcs, tpr_rfcs, _ = roc_curve(self.y_test, self.rf_cs_model.predict_proba(self.X_test_scaled)[:, 1])
         plt.plot(fpr_rfcs, tpr_rfcs, label=f'Cost-Sensitive RF (AUC = {roc_auc_score(self.y_test, self.rf_cs_model.predict_proba(self.X_test_scaled)[:, 1]):.2f})')
+
+        fpr_lr, tpr_lr, _ = roc_curve(self.y_test, self.lr_model.predict_proba(self.X_test_scaled)[:, 1])
+        plt.plot(fpr_lr, tpr_lr, label=f'Logistic Regression (AUC = {roc_auc_score(self.y_test, self.lr_model.predict_proba(self.X_test_scaled)[:, 1]):.2f})')
 
         plt.plot([0, 1], [0, 1], 'k--')
         plt.xlabel('False Positive Rate')
@@ -386,6 +504,7 @@ class MLPipeline:
             "DNN": (self.dnn_model.predict(self.X_test_scaled, verbose=0) > 0.5).astype("int32").flatten(),
             "AdaBoost": self.ada_preds,
             "Cost-Sensitive RF": self.rf_cs_preds,
+            "Logistic Regression": self.lr_model.predict(self.X_test_scaled)
         }
         results = {
             "Model": [],
@@ -412,16 +531,17 @@ class MLPipeline:
         plt.savefig("model_comparison_plot.png")
         plt.close()
 
-# Main block to run the full ML pipeline
 if __name__ == "__main__":
     pipeline = MLPipeline("NF-UNSW-NB15-V2.csv")
     pipeline.load_dataset()
     pipeline.preprocess_data()
+    pipeline.check_data_leakage()
     pipeline.train_random_forest()
     pipeline.train_xgboost()
     pipeline.train_dnn()
     pipeline.train_adaboost()
     pipeline.train_cost_sensitive_rf()
+    pipeline.train_logistic_regression()
     pipeline.visualize_heatmap()
     pipeline.visualize_label_distribution()
     pipeline.visualize_normalized_labels()
