@@ -231,17 +231,6 @@ class MLPipeline:
         print("Cost-Sensitive RF Report:\n", classification_report(self.y_test, self.rf_cs_preds))
         self.cross_validate_model(self.rf_cs_model, "Cost-Sensitive RF")
 
-    def train_logistic_regression(self):
-        """Train Logistic Regression as a baseline."""
-        start = time.time()
-        self.lr_model = LogisticRegression(class_weight='balanced', random_state=42)
-        self.lr_model.fit(self.X_train_scaled, self.y_train)
-        end = time.time()
-        self.training_times['Logistic Regression'] = end - start
-        preds = self.lr_model.predict(self.X_test_scaled)
-        print("Logistic Regression Classification Report:\n", classification_report(self.y_test, preds))
-        self.cross_validate_model(self.lr_model, "Logistic Regression")
-
     def compute_subset_metrics(self, model, model_name):
         """Compute training and validation accuracy over data subsets."""
         fractions = [0.2, 0.4, 0.6, 0.8, 1.0]
@@ -503,8 +492,7 @@ class MLPipeline:
             "XGBoost": self.xgb_model.predict(self.X_test_scaled),
             "DNN": (self.dnn_model.predict(self.X_test_scaled, verbose=0) > 0.5).astype("int32").flatten(),
             "AdaBoost": self.ada_preds,
-            "Cost-Sensitive RF": self.rf_cs_preds,
-            "Logistic Regression": self.lr_model.predict(self.X_test_scaled)
+            "Cost-Sensitive RF": self.rf_cs_preds
         }
         results = {
             "Model": [],
@@ -541,22 +529,21 @@ if __name__ == "__main__":
     pipeline.train_dnn()
     pipeline.train_adaboost()
     pipeline.train_cost_sensitive_rf()
-    pipeline.train_logistic_regression()
-    pipeline.visualize_heatmap()
-    pipeline.visualize_label_distribution()
-    pipeline.visualize_normalized_labels()
-    pipeline.visualize_rf_importance()
-    pipeline.visualize_xgb_importance()
-    pipeline.visualize_adaboost_importance()
-    pipeline.visualize_cost_sensitive_rf_importance()
-    pipeline.visualize_dnn_permutation_importance()
-    pipeline.visualize_dnn_metrics()
-    pipeline.visualize_rf_metrics()
-    pipeline.visualize_xgb_metrics()
-    pipeline.visualize_adaboost_metrics()
-    pipeline.visualize_cost_sensitive_rf_metrics()
-    pipeline.visualize_pca_projection()
-    pipeline.visualize_confusion_matrices()
-    pipeline.visualize_roc_curves()
-    pipeline.visualize_training_time()
+    # pipeline.visualize_heatmap()
+    # pipeline.visualize_label_distribution()
+    # pipeline.visualize_normalized_labels()
+    # pipeline.visualize_rf_importance()
+    # pipeline.visualize_xgb_importance()
+    # pipeline.visualize_adaboost_importance()
+    # pipeline.visualize_cost_sensitive_rf_importance()
+    # pipeline.visualize_dnn_permutation_importance()
+    # pipeline.visualize_dnn_metrics()
+    # pipeline.visualize_rf_metrics()
+    # pipeline.visualize_xgb_metrics()
+    # pipeline.visualize_adaboost_metrics()
+    # pipeline.visualize_cost_sensitive_rf_metrics()
+    # pipeline.visualize_pca_projection()
+    # pipeline.visualize_confusion_matrices()
+    # pipeline.visualize_roc_curves()
+    # pipeline.visualize_training_time()
     pipeline.plot_model_comparison()
